@@ -17,15 +17,25 @@ function generateSessionToken(): string {
 async function isValidSession(sessionToken: string): Promise<boolean> {
   if (!REQUIRE_AUTH) return true;
   
-  const result = await kv.get([...SESSION_KEY, sessionToken]);
-  return result.value !== null;
+  try {
+    const result = await kv.get([...SESSION_KEY, sessionToken]);
+    return result.value !== null;
+  } catch (error) {
+    console.error("Session validation error:", error);
+    return false;
+  }
 }
 
 // 创建会话
 async function createSession(): Promise<string> {
   const token = generateSessionToken();
-  await kv.set([...SESSION_KEY, token], true, { expireIn: 24 * 60 * 60 * 1000 }); // 24小时过期
-  return token;
+  try {
+    await kv.set([...SESSION_KEY, token], true, { expireIn: 24 * 60 * 60 * 1000 }); // 24小时过期
+    return token;
+  } catch (error) {
+    console.error("Session creation error:", error);
+    throw error;
+  }
 }
 
 // 获取会话 token 从 cookie
@@ -537,172 +547,219 @@ function generateLoginHTML(error?: string): string {
 }
 
 Deno.serve(async (req) => {
-  const url = new URL(req.url);
-  const sessionToken = getSessionFromCookie(req);
+  try {
+    const url = new URL(req.url);
+    const sessionToken = getSessionFromCookie(req);
 
-  // 处理登录请求
-  if (url.pathname === "/login" && req.method === "POST") {
-    const formData = await req.formData();
-    const password = formData.get("password") as string;
-    
-    if (password === ADMIN_PASSWORD) {
-      const token = await createSession();
-      const headers = new Headers({
-        "Content-Type": "text/html; charset=utf-8",
-        "Set-Cookie": `session=${token}; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict`,
-        "Location": "/"
-      });
-      return new Response(null, { status: 302, headers });
-    } else {
-      return new Response(generateLoginHTML("密码错误，请重试"), {
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
-  }
-
-  // 检查是否需要登录
-  if (REQUIRE_AUTH && !await isValidSession(sessionToken)) {
-    if (url.pathname === "/login") {
-      return new Response(generateLoginHTML(), {
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
-    const headers = new Headers({
-      "Location": "/login"
-    });
-    return new Response(null, { status: 302, headers });
-  }
-
-  // 处理主页面的 POST 请求（设置代理目标）
-  if (url.pathname === "/" && req.method === "POST") {
-    const formData = await req.formData();
-    const targetUrl = formData.get("targetUrl") as string;
-    const action = formData.get("action") as string;
-    
-    if (targetUrl) {
+    // 处理登录请求
+    if (url.pathname === "/login" && req.method === "POST") {
       try {
-        new URL(targetUrl);
-        await kv.set(TARGET_KEY, targetUrl);
+        const formData = await req.formData();
+        const password = formData.get("password") as string;
         
-        if (action === "set") {
-          return new Response(generateHTML(targetUrl, undefined, "代理目标已成功设置！"), {
+        if (password === ADMIN_PASSWORD) {
+          const token = await createSession();
+          const headers = new Headers({
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": `session=${token}; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict`,
+            "Location": "/"
+          });
+          return new Response(null, { status: 302, headers });
+        } else {
+          return new Response(generateLoginHTML("密码错误，请重试"), {
             headers: { "Content-Type": "text/html; charset=utf-8" }
           });
         }
-      } catch {
-        return new Response(generateHTML(undefined, "无效的 URL 格式，请检查后重试"), {
+      } catch (error) {
+        console.error("Login error:", error);
+        return new Response(generateLoginHTML("登录过程中发生错误，请重试"), {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
       }
     }
-  }
 
-  // 处理主页面
-  if (url.pathname === "/") {
-    const result = await kv.get(TARGET_KEY);
-    const currentTarget = result.value as string | null;
-    
-    return new Response(generateHTML(currentTarget), {
-      headers: { "Content-Type": "text/html; charset=utf-8" }
-    });
-  }
-
-  // 处理代理请求
-  if (url.pathname.startsWith("/proxy")) {
-    const result = await kv.get(TARGET_KEY);
-    if (!result.value) {
-      return new Response("未设置代理目标 URL，请先在主页设置目标网址。", { 
-        status: 400,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
-    }
-    
-    const baseUrl = result.value as string;
-    const proxyPath = url.pathname.slice("/proxy".length);
-    
-    let finalUrl: string;
-    try {
-      finalUrl = new URL(proxyPath + url.search, baseUrl).toString();
-    } catch {
-      return new Response("构造目标 URL 出错。", { 
-        status: 500,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
-    }
-
-    // 构造代理请求
-    const proxyHeaders = new Headers();
-    for (const [key, value] of req.headers.entries()) {
-      // 过滤掉一些不需要转发的头部
-      if (!["host", "cookie"].includes(key.toLowerCase())) {
-        proxyHeaders.set(key, value);
-      }
-    }
-
-    const proxyRequest = new Request(finalUrl, {
-      method: req.method,
-      headers: proxyHeaders,
-      body: req.body,
-    });
-
-    try {
-      const targetResponse = await fetch(proxyRequest);
-      const body = await targetResponse.arrayBuffer();
-
-      const responseHeaders = new Headers();
-      for (const [key, value] of targetResponse.headers.entries()) {
-        // 处理一些特殊的响应头
-        if (!["set-cookie", "content-security-policy"].includes(key.toLowerCase())) {
-          responseHeaders.set(key, value);
-        }
-      }
-
-      // 如果是 HTML 内容，可以进行一些处理来确保链接正确工作
-      const contentType = targetResponse.headers.get("content-type") || "";
-      if (contentType.includes("text/html")) {
-        let html = new TextDecoder().decode(body);
-        // 简单的链接重写，将相对链接转换为代理链接
-        html = html.replace(/(href|src)="\/([^"]*?)"/g, `$1="/proxy/$2"`);
-        html = html.replace(/(href|src)='\/([^']*?)'/g, `$1='/proxy/$2'`);
-        
-        return new Response(html, {
-          status: targetResponse.status,
-          headers: responseHeaders,
+    // 检查是否需要登录
+    if (REQUIRE_AUTH && !await isValidSession(sessionToken)) {
+      if (url.pathname === "/login") {
+        return new Response(generateLoginHTML(), {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
         });
       }
-
-      return new Response(body, {
-        status: targetResponse.status,
-        headers: responseHeaders,
+      const headers = new Headers({
+        "Location": "/login"
       });
-    } catch (err) {
-      return new Response(`请求目标 URL 时发生错误：${err}`, {
-        status: 500,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
+      return new Response(null, { status: 302, headers });
     }
-  }
 
-  // 处理旧的 setUrl 参数（向后兼容）
-  if (url.searchParams.has("setUrl")) {
-    const newTargetUrl = url.searchParams.get("setUrl")!;
-    try {
-      new URL(newTargetUrl);
-      await kv.set(TARGET_KEY, newTargetUrl);
-      return new Response(`代理目标 URL 已更新为：${newTargetUrl}`, {
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
-    } catch {
-      return new Response("无效的 URL，请检查格式。", { 
-        status: 400,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
+    // 处理主页面的 POST 请求（设置代理目标）
+    if (url.pathname === "/" && req.method === "POST") {
+      try {
+        const formData = await req.formData();
+        const targetUrl = formData.get("targetUrl") as string;
+        const action = formData.get("action") as string;
+        
+        if (targetUrl) {
+          try {
+            new URL(targetUrl);
+            await kv.set(TARGET_KEY, targetUrl);
+            
+            if (action === "set") {
+              return new Response(generateHTML(targetUrl, undefined, "代理目标已成功设置！"), {
+                headers: { "Content-Type": "text/html; charset=utf-8" }
+              });
+            }
+          } catch {
+            return new Response(generateHTML(undefined, "无效的 URL 格式，请检查后重试"), {
+              headers: { "Content-Type": "text/html; charset=utf-8" }
+            });
+          }
+        }
+      } catch (error) {
+        console.error("Form processing error:", error);
+        return new Response(generateHTML(undefined, "处理请求时发生错误，请重试"), {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+      }
     }
-  }
 
-  // 404 处理
-  return new Response("页面未找到", { 
-    status: 404,
-    headers: { "Content-Type": "text/plain; charset=utf-8" }
-  });
+    // 处理主页面
+    if (url.pathname === "/") {
+      try {
+        const result = await kv.get(TARGET_KEY);
+        const currentTarget = result.value as string | null;
+        
+        return new Response(generateHTML(currentTarget), {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+      } catch (error) {
+        console.error("Homepage error:", error);
+        return new Response(generateHTML(undefined, "加载页面时发生错误"), {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+      }
+    }
+
+    // 处理代理请求
+    if (url.pathname.startsWith("/proxy")) {
+      try {
+        const result = await kv.get(TARGET_KEY);
+        if (!result.value) {
+          return new Response("未设置代理目标 URL，请先在主页设置目标网址。", { 
+            status: 400,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+        
+        const baseUrl = result.value as string;
+        const proxyPath = url.pathname.slice("/proxy".length);
+        
+        let finalUrl: string;
+        try {
+          finalUrl = new URL(proxyPath + url.search, baseUrl).toString();
+        } catch {
+          return new Response("构造目标 URL 出错。", { 
+            status: 500,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+
+        // 构造代理请求
+        const proxyHeaders = new Headers();
+        for (const [key, value] of req.headers.entries()) {
+          // 过滤掉一些不需要转发的头部
+          if (!["host", "cookie"].includes(key.toLowerCase())) {
+            proxyHeaders.set(key, value);
+          }
+        }
+
+        const proxyRequest = new Request(finalUrl, {
+          method: req.method,
+          headers: proxyHeaders,
+          body: req.body,
+        });
+
+        try {
+          const targetResponse = await fetch(proxyRequest);
+          const body = await targetResponse.arrayBuffer();
+
+          const responseHeaders = new Headers();
+          for (const [key, value] of targetResponse.headers.entries()) {
+            // 处理一些特殊的响应头
+            if (!["set-cookie", "content-security-policy"].includes(key.toLowerCase())) {
+              responseHeaders.set(key, value);
+            }
+          }
+
+          // 如果是 HTML 内容，可以进行一些处理来确保链接正确工作
+          const contentType = targetResponse.headers.get("content-type") || "";
+          if (contentType.includes("text/html")) {
+            let html = new TextDecoder().decode(body);
+            // 简单的链接重写，将相对链接转换为代理链接
+            html = html.replace(/(href|src)="\/([^"]*?)"/g, `$1="/proxy/$2"`);
+            html = html.replace(/(href|src)='\/([^']*?)'/g, `$1='/proxy/$2'`);
+            
+            return new Response(html, {
+              status: targetResponse.status,
+              headers: responseHeaders,
+            });
+          }
+
+          return new Response(body, {
+            status: targetResponse.status,
+            headers: responseHeaders,
+          });
+        } catch (err) {
+          console.error("Proxy request error:", err);
+          return new Response(`请求目标 URL 时发生错误：${err}`, {
+            status: 500,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+      } catch (error) {
+        console.error("Proxy handler error:", error);
+        return new Response("代理服务发生错误", {
+          status: 500,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+      }
+    }
+
+    // 处理旧的 setUrl 参数（向后兼容）
+    if (url.searchParams.has("setUrl")) {
+      try {
+        const newTargetUrl = url.searchParams.get("setUrl")!;
+        try {
+          new URL(newTargetUrl);
+          await kv.set(TARGET_KEY, newTargetUrl);
+          return new Response(`代理目标 URL 已更新为：${newTargetUrl}`, {
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        } catch {
+          return new Response("无效的 URL，请检查格式。", { 
+            status: 400,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+      } catch (error) {
+        console.error("SetUrl error:", error);
+        return new Response("设置 URL 时发生错误", {
+          status: 500,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+      }
+    }
+
+    // 404 处理
+    return new Response("页面未找到", { 
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+
+  } catch (error) {
+    console.error("Server error:", error);
+    return new Response("服务器内部错误", {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+  }
 });
